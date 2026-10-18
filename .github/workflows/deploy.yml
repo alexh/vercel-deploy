@@ -1,0 +1,126 @@
+# Reusable Vercel deploy: "vercel pull → vercel build → vercel deploy --prebuilt", run from GitHub
+# Actions instead of Vercel's Git integration.
+#   push to the default branch → production (--prod)
+#   push to any other branch   → preview (--target preview)
+# `vercel pull` brings down the project's own settings (framework, install and build commands, root
+# directory, Node version, env), so nothing about the build lives here.
+#
+# The caller passes its Vercel project id (keep it in a repository variable, not in the file) and the
+# team slug, and provides a VERCEL_TOKEN secret with `secrets: inherit`. The team id is looked up at
+# run time from the slug. Without the token the deploy is skipped with a notice, not failed.
+name: Vercel deploy
+
+on:
+  workflow_call:
+    inputs:
+      project-id:
+        description: Vercel project id (prj_…); pass it from a repository variable
+        required: true
+        type: string
+      scope:
+        description: Vercel team slug, passed to every CLI call
+        required: true
+        type: string
+      bun-version:
+        type: string
+        default: 1.3.x
+      vercel-cli:
+        type: string
+        default: vercel@64.0.2
+    secrets:
+      VERCEL_TOKEN:
+        required: false
+    outputs:
+      url:
+        description: The deployment URL
+        value: ${{ jobs.deploy.outputs.url }}
+
+jobs:
+  token:
+    runs-on: ubuntu-latest
+    outputs:
+      present: ${{ steps.check.outputs.present }}
+    steps:
+      - id: check
+        env:
+          HAS_TOKEN: ${{ secrets.VERCEL_TOKEN != '' }}
+        run: |
+          echo "present=$HAS_TOKEN" >> "$GITHUB_OUTPUT"
+          [ "$HAS_TOKEN" = true ] || echo "::notice::VERCEL_TOKEN is not set in this repo; skipping the Vercel deploy."
+
+  deploy:
+    needs: token
+    if: needs.token.outputs.present == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: vercel-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: true
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+    env:
+      VERCEL_PROJECT_ID: ${{ inputs.project-id }}
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      CLI: ${{ inputs.vercel-cli }}
+      # inspect / rm don't read VERCEL_ORG_ID and fall back to the token owner's personal scope,
+      # so every call names the team.
+      SCOPE: ${{ inputs.scope }}
+      VERCEL_ENV: ${{ github.ref_name == github.event.repository.default_branch && 'production' || 'preview' }}
+    steps:
+      - name: Resolve the team id
+        run: |
+          id=$(curl -sf -H "Authorization: Bearer $VERCEL_TOKEN" "https://api.vercel.com/v2/teams/$SCOPE" | jq -r '.id // empty')
+          [ -n "$id" ] || { echo "::error::Couldn't resolve Vercel team '$SCOPE' with this token."; exit 1; }
+          echo "::add-mask::$id"
+          echo "VERCEL_ORG_ID=$id" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Pull Vercel settings and env (${{ env.VERCEL_ENV }})
+        run: bunx $CLI pull --scope=$SCOPE --yes --environment=$VERCEL_ENV --token=$VERCEL_TOKEN
+      - name: Read the project's Node version
+        id: node
+        run: echo "version=$(jq -r '.settings.nodeVersion // "24.x"' .vercel/project.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      - name: Build
+        run: bunx $CLI build --scope=$SCOPE --target=$VERCEL_ENV --token=$VERCEL_TOKEN
+      - name: Drop cron definitions from preview builds
+        # Previews never run crons anyway; stripping them means even a build Vercel wrongly
+        # promotes to production (see the guard below) can't fire scheduled jobs.
+        if: env.VERCEL_ENV == 'preview'
+        run: |
+          if jq -e '.crons' .vercel/output/config.json > /dev/null; then
+            jq 'del(.crons)' .vercel/output/config.json > config.json && mv config.json .vercel/output/config.json
+          fi
+      - name: Deploy
+        id: deploy
+        run: |
+          if [ "$VERCEL_ENV" = production ]; then
+            url=$(bunx $CLI deploy --scope=$SCOPE --prebuilt --prod --token=$VERCEL_TOKEN)
+          else
+            url=$(bunx $CLI deploy --scope=$SCOPE --prebuilt --target=preview --token=$VERCEL_TOKEN)
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "### Deployed ($VERCEL_ENV): $url" >> "$GITHUB_STEP_SUMMARY"
+      - name: Guard against a branch landing in production
+        # Vercel makes a project's first deployment production even when asked for a preview. A
+        # branch must never go live, so anything but an explicit "preview" is removed (fail closed).
+        if: env.VERCEL_ENV == 'preview'
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          target=$(bunx $CLI inspect --scope=$SCOPE "$URL" --format=json --token=$VERCEL_TOKEN 2>/dev/null | jq -r '.target // empty' || true)
+          echo "target: ${target:-<none>}"
+          if [ "$target" != preview ]; then
+            if bunx $CLI rm --scope=$SCOPE "$URL" --yes --token=$VERCEL_TOKEN; then
+              echo "::error::Branch deployment came back as '${target:-<none>}', not preview; it was removed."
+            else
+              echo "::error::Branch deployment came back as '${target:-<none>}' and could NOT be removed. Remove $URL by hand."
+            fi
+            exit 1
+          fi
