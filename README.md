@@ -37,4 +37,4 @@ Until the secret exists, runs skip the deploy with a notice instead of failing. 
 | `project-id` | required | Vercel project id |
 | `scope` | required | Vercel team slug; the team id is resolved from it at run time |
 | `bun-version` | `1.3.x` | |
-| `vercel-cli` | `vercel@64.0.2` | pinned CLI |
+| `vercel-cli` | `vercel@64.7.0` | pinned CLI |
